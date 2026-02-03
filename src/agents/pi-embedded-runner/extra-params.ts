@@ -31,19 +31,36 @@ type CacheRetentionStreamOptions = Partial<SimpleStreamOptions> & {
 };
 
 /**
+ * Check if a provider is a Google/Gemini provider.
+ */
+function isGoogleProvider(provider: string): boolean {
+  const normalized = provider.toLowerCase();
+  return (
+    normalized === "google" ||
+    normalized === "google-gemini-cli" ||
+    normalized === "google-antigravity"
+  );
+}
+
+/**
  * Resolve cacheRetention from extraParams, supporting both new `cacheRetention`
  * and legacy `cacheControlTtl` values for backwards compatibility.
  *
  * Mapping: "5m" → "short", "1h" → "long"
  *
- * Only applies to Anthropic provider (OpenRouter uses openai-completions API
- * with hardcoded cache_control, not the cacheRetention stream option).
+ * Supported providers:
+ * - Anthropic: Uses cache_control in request
+ * - Google Gemini: Uses context caching (implicit/explicit)
+ *
+ * OpenRouter uses openai-completions API with hardcoded cache_control,
+ * not the cacheRetention stream option.
  */
 function resolveCacheRetention(
   extraParams: Record<string, unknown> | undefined,
   provider: string,
 ): CacheRetention | undefined {
-  if (provider !== "anthropic") {
+  // Support both Anthropic and Google providers
+  if (provider !== "anthropic" && !isGoogleProvider(provider)) {
     return undefined;
   }
 
@@ -61,35 +78,80 @@ function resolveCacheRetention(
   if (legacy === "1h") {
     return "long";
   }
+
+  // Default for Google: enable short caching (5 min) for better implicit cache hits
+  // Gemini's implicit caching works best when system prompts are stable
+  if (isGoogleProvider(provider)) {
+    return "short";
+  }
+
   return undefined;
 }
+
+/**
+ * Resolve Gemini-specific cache TTL in seconds.
+ * Used for explicit caching configuration.
+ *
+ * | cacheRetention | TTL (seconds) |
+ * |----------------|---------------|
+ * | "short"        | 300 (5 min)   |
+ * | "long"         | 3600 (1 hour) |
+ */
+export function resolveGeminiCacheTtlSeconds(cacheRetention: CacheRetention): number | undefined {
+  switch (cacheRetention) {
+    case "short":
+      return 300;
+    case "long":
+      return 3600;
+    case "none":
+    default:
+      return undefined;
+  }
+}
+
+type GeminiCacheStreamOptions = CacheRetentionStreamOptions & {
+  /** Gemini-specific: TTL for cached content in seconds */
+  cacheTtlSeconds?: number;
+};
 
 function createStreamFnWithExtraParams(
   baseStreamFn: StreamFn | undefined,
   extraParams: Record<string, unknown> | undefined,
   provider: string,
 ): StreamFn | undefined {
-  if (!extraParams || Object.keys(extraParams).length === 0) {
+  // For Google providers, we want to apply default caching even without explicit extraParams
+  const isGoogle = isGoogleProvider(provider);
+  if (!isGoogle && (!extraParams || Object.keys(extraParams).length === 0)) {
     return undefined;
   }
 
-  const streamParams: CacheRetentionStreamOptions = {};
-  if (typeof extraParams.temperature === "number") {
+  const streamParams: GeminiCacheStreamOptions = {};
+  if (typeof extraParams?.temperature === "number") {
     streamParams.temperature = extraParams.temperature;
   }
-  if (typeof extraParams.maxTokens === "number") {
+  if (typeof extraParams?.maxTokens === "number") {
     streamParams.maxTokens = extraParams.maxTokens;
   }
+
   const cacheRetention = resolveCacheRetention(extraParams, provider);
-  if (cacheRetention) {
+  if (cacheRetention && cacheRetention !== "none") {
     streamParams.cacheRetention = cacheRetention;
+
+    // For Google providers, also set cacheTtlSeconds for explicit caching
+    if (isGoogle) {
+      const ttlSeconds = resolveGeminiCacheTtlSeconds(cacheRetention);
+      if (ttlSeconds) {
+        streamParams.cacheTtlSeconds = ttlSeconds;
+      }
+    }
   }
 
   if (Object.keys(streamParams).length === 0) {
     return undefined;
   }
 
-  log.debug(`creating streamFn wrapper with params: ${JSON.stringify(streamParams)}`);
+  const providerHint = isGoogle ? " (Gemini context caching enabled)" : "";
+  log.debug(`creating streamFn wrapper with params: ${JSON.stringify(streamParams)}${providerHint}`);
 
   const underlying = baseStreamFn ?? streamSimple;
   const wrappedStreamFn: StreamFn = (model, context, options) =>

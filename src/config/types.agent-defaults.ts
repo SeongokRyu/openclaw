@@ -98,6 +98,14 @@ export type AgentDefaultsConfig = {
   imageModel?: AgentModelListConfig;
   /** Model catalog with optional aliases (full provider/model keys). */
   models?: Record<string, AgentModelEntryConfig>;
+  /**
+   * System prompt mode for token optimization:
+   * - "full": All sections (default)
+   * - "compact": Reduced verbosity for token efficiency (good for caching)
+   * - "minimal": Minimal sections for subagents
+   * - "none": Just identity line
+   */
+  promptMode?: "full" | "compact" | "minimal" | "none";
   /** Agent working directory (preferred). Used as the default cwd for agent runs. */
   workspace?: string;
   /** Optional repository root for system prompt runtime line (overrides auto-detect). */

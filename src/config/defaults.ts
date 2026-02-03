@@ -439,6 +439,119 @@ export function applyContextPruningDefaults(cfg: OpenClawConfig): OpenClawConfig
   };
 }
 
+/**
+ * Check if a model ID appears to be a Gemini model that supports caching.
+ * Gemini 2.0+, 2.5+, and experimental models support context caching.
+ */
+function isGeminiCacheEligibleModel(modelId: string): boolean {
+  const normalized = modelId.toLowerCase();
+  return (
+    normalized.includes("gemini-2.0") ||
+    normalized.includes("gemini-2.5") ||
+    normalized.includes("gemini-3") ||
+    normalized.includes("gemini-exp")
+  );
+}
+
+/**
+ * Apply Gemini context caching defaults.
+ * For Google/Gemini models, enable cacheRetention: "short" by default
+ * to take advantage of implicit/explicit caching.
+ */
+export function applyGeminiCachingDefaults(cfg: OpenClawConfig): OpenClawConfig {
+  const defaults = cfg.agents?.defaults;
+  if (!defaults) {
+    return cfg;
+  }
+
+  // Check if the primary model is a Google/Gemini model
+  const primaryModel = defaults.model?.primary;
+  if (!primaryModel) {
+    return cfg;
+  }
+
+  const parsed = parseModelRef(primaryModel, "google");
+  const isGoogleProvider =
+    parsed?.provider === "google" ||
+    parsed?.provider === "google-gemini-cli" ||
+    parsed?.provider === "google-antigravity";
+
+  if (!isGoogleProvider) {
+    return cfg;
+  }
+
+  // Check if the model supports caching
+  if (!isGeminiCacheEligibleModel(parsed.model)) {
+    return cfg;
+  }
+
+  let mutated = false;
+  const nextDefaults = { ...defaults };
+  const nextModels = defaults.models ? { ...defaults.models } : {};
+
+  // Apply cacheRetention to all eligible Gemini models
+  for (const [key, entry] of Object.entries(nextModels)) {
+    const modelParsed = parseModelRef(key, "google");
+    const isGoogle =
+      modelParsed?.provider === "google" ||
+      modelParsed?.provider === "google-gemini-cli" ||
+      modelParsed?.provider === "google-antigravity";
+
+    if (!isGoogle || !isGeminiCacheEligibleModel(modelParsed?.model ?? "")) {
+      continue;
+    }
+
+    const current = entry ?? {};
+    const params = (current as { params?: Record<string, unknown> }).params ?? {};
+    if (typeof params.cacheRetention === "string") {
+      continue;
+    }
+
+    nextModels[key] = {
+      ...(current as Record<string, unknown>),
+      params: { ...params, cacheRetention: "short" },
+    };
+    mutated = true;
+  }
+
+  // Also apply to primary model if not already configured
+  const primaryKey = `${parsed.provider}/${parsed.model}`;
+  const primaryEntry = nextModels[primaryKey];
+  const primaryCurrent = primaryEntry ?? {};
+  const primaryParams = (primaryCurrent as { params?: Record<string, unknown> }).params ?? {};
+  if (typeof primaryParams.cacheRetention !== "string") {
+    nextModels[primaryKey] = {
+      ...(primaryCurrent as Record<string, unknown>),
+      params: { ...primaryParams, cacheRetention: "short" },
+    };
+    mutated = true;
+  }
+
+  // Enable cache-ttl context pruning for Gemini if not explicitly configured
+  if (defaults.contextPruning?.mode === undefined) {
+    nextDefaults.contextPruning = {
+      ...defaults.contextPruning,
+      mode: "cache-ttl",
+      ttl: defaults.contextPruning?.ttl ?? "1h",
+    };
+    mutated = true;
+  }
+
+  if (!mutated) {
+    return cfg;
+  }
+
+  nextDefaults.models = nextModels;
+
+  return {
+    ...cfg,
+    agents: {
+      ...cfg.agents,
+      defaults: nextDefaults,
+    },
+  };
+}
+
 export function applyCompactionDefaults(cfg: OpenClawConfig): OpenClawConfig {
   const defaults = cfg.agents?.defaults;
   if (!defaults) {

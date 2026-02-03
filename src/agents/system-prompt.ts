@@ -8,10 +8,48 @@ import { listDeliverableMessageChannels } from "../utils/message-channel.js";
 /**
  * Controls which hardcoded sections are included in the system prompt.
  * - "full": All sections (default, for main agent)
- * - "minimal": Reduced sections (Tooling, Workspace, Runtime) - used for subagents
+ * - "compact": Reduced verbosity for token optimization (keeps core functionality)
+ * - "minimal": Minimal sections (Tooling, Workspace, Runtime) - used for subagents
  * - "none": Just basic identity line, no sections
  */
-export type PromptMode = "full" | "minimal" | "none";
+export type PromptMode = "full" | "compact" | "minimal" | "none";
+
+/**
+ * Maximum characters for context files in compact mode.
+ * Each file will be truncated to this limit to save tokens.
+ */
+const COMPACT_CONTEXT_FILE_MAX_CHARS = 2000;
+
+/**
+ * Compact tool summaries - shorter descriptions to save tokens.
+ * Used when promptMode is "compact".
+ */
+const compactToolSummaries: Record<string, string> = {
+  read: "Read files",
+  write: "Write files",
+  edit: "Edit files",
+  apply_patch: "Apply patches",
+  grep: "Search files",
+  find: "Find files",
+  ls: "List dirs",
+  exec: "Run commands",
+  process: "Manage processes",
+  web_search: "Web search",
+  web_fetch: "Fetch URL",
+  browser: "Browser control",
+  canvas: "Canvas operations",
+  nodes: "Node control",
+  cron: "Schedule tasks/reminders",
+  message: "Send messages",
+  gateway: "Restart/update OpenClaw",
+  agents_list: "List agents",
+  sessions_list: "List sessions",
+  sessions_history: "Get history",
+  sessions_send: "Send to session",
+  sessions_spawn: "Spawn sub-agent",
+  session_status: "Show status/usage",
+  image: "Analyze images",
+};
 
 function buildSkillsSection(params: {
   skillsPrompt?: string;
@@ -346,7 +384,27 @@ export function buildAgentSystemPrompt(params: {
   const inlineButtonsEnabled = runtimeCapabilitiesLower.has("inlinebuttons");
   const messageChannelOptions = listDeliverableMessageChannels().join("|");
   const promptMode = params.promptMode ?? "full";
+  const isCompact = promptMode === "compact";
   const isMinimal = promptMode === "minimal" || promptMode === "none";
+
+  // For "compact" mode, return a token-optimized prompt
+  if (isCompact) {
+    return buildCompactSystemPrompt({
+      workspaceDir: params.workspaceDir,
+      toolNames: canonicalToolNames,
+      resolveToolName,
+      availableTools,
+      externalToolSummaries,
+      toolOrder,
+      extraSystemPrompt,
+      userTimezone,
+      contextFiles: params.contextFiles,
+      runtimeInfo: params.runtimeInfo,
+      reasoningLevel,
+      defaultThinkLevel: params.defaultThinkLevel,
+    });
+  }
+
   const safetySection = [
     "## Safety",
     "You have no independent goals: do not pursue self-preservation, replication, resource acquisition, or power-seeking; avoid long-term plans beyond the user's request.",
@@ -605,6 +663,170 @@ export function buildAgentSystemPrompt(params: {
   );
 
   return lines.filter(Boolean).join("\n");
+}
+
+/**
+ * Build a compact system prompt optimized for token efficiency.
+ * Reduces verbosity while maintaining core functionality.
+ * Used when promptMode is "compact" - ideal for context caching scenarios.
+ */
+function buildCompactSystemPrompt(params: {
+  workspaceDir: string;
+  toolNames: string[];
+  resolveToolName: (normalized: string) => string;
+  availableTools: Set<string>;
+  externalToolSummaries: Map<string, string>;
+  toolOrder: string[];
+  extraSystemPrompt?: string;
+  userTimezone?: string;
+  contextFiles?: EmbeddedContextFile[];
+  runtimeInfo?: {
+    agentId?: string;
+    host?: string;
+    os?: string;
+    arch?: string;
+    node?: string;
+    model?: string;
+    defaultModel?: string;
+    channel?: string;
+    capabilities?: string[];
+    repoRoot?: string;
+  };
+  reasoningLevel: ReasoningLevel;
+  defaultThinkLevel?: ThinkLevel;
+}): string {
+  const {
+    workspaceDir,
+    toolNames,
+    resolveToolName,
+    availableTools,
+    externalToolSummaries,
+    toolOrder,
+    extraSystemPrompt,
+    userTimezone,
+    contextFiles,
+    runtimeInfo,
+    reasoningLevel,
+    defaultThinkLevel,
+  } = params;
+
+  // Build compact tool list using short summaries
+  const enabledTools = toolOrder.filter((tool) => availableTools.has(tool));
+  const extraTools = Array.from(
+    new Set(toolNames.map((t) => t.toLowerCase()).filter((tool) => !toolOrder.includes(tool))),
+  );
+
+  const toolLines = enabledTools.map((tool) => {
+    const summary =
+      compactToolSummaries[tool] ?? externalToolSummaries.get(tool) ?? tool;
+    const name = resolveToolName(tool);
+    return `${name}: ${summary}`;
+  });
+
+  for (const tool of extraTools.toSorted()) {
+    const summary =
+      compactToolSummaries[tool] ?? externalToolSummaries.get(tool) ?? tool;
+    const name = resolveToolName(tool);
+    toolLines.push(`${name}: ${summary}`);
+  }
+
+  const lines: string[] = [
+    "You are a personal assistant (OpenClaw). Be concise and helpful.",
+    "",
+    "## Tools",
+    toolLines.join(" | "),
+    "",
+    `## Workspace: ${workspaceDir}`,
+  ];
+
+  // Add timezone if available (but not full time section)
+  if (userTimezone) {
+    lines.push(`Timezone: ${userTimezone}`);
+  }
+  lines.push("");
+
+  // Safety - condensed version
+  lines.push(
+    "## Safety",
+    "No independent goals. Pause if unsafe. Comply with stop/audit requests.",
+    "",
+  );
+
+  // Silent reply token - condensed
+  lines.push(`Silent reply: ${SILENT_REPLY_TOKEN} (when nothing to say)`, "");
+
+  // Heartbeat - condensed
+  lines.push("Heartbeat poll → HEARTBEAT_OK (if nothing needs attention)", "");
+
+  // Extra system prompt (group context, etc.)
+  if (extraSystemPrompt) {
+    lines.push("## Context", extraSystemPrompt, "");
+  }
+
+  // Context files - truncated for token efficiency
+  if (contextFiles && contextFiles.length > 0) {
+    lines.push("## Project Context (truncated for efficiency)");
+    for (const file of contextFiles) {
+      const truncatedContent = truncateContextFile(file.content, COMPACT_CONTEXT_FILE_MAX_CHARS);
+      lines.push(`### ${file.path}`, truncatedContent, "");
+    }
+  }
+
+  // Runtime info - compact version
+  const runtimeChannel = runtimeInfo?.channel?.trim().toLowerCase();
+  const runtimeCapabilities = (runtimeInfo?.capabilities ?? [])
+    .map((cap) => String(cap).trim())
+    .filter(Boolean);
+
+  lines.push(
+    "## Runtime",
+    buildCompactRuntimeLine(runtimeInfo, runtimeChannel, runtimeCapabilities, defaultThinkLevel),
+    `Reasoning: ${reasoningLevel}`,
+  );
+
+  return lines.filter(Boolean).join("\n");
+}
+
+/**
+ * Truncate context file content to save tokens.
+ * Keeps the beginning (usually most important) and adds truncation notice.
+ */
+function truncateContextFile(content: string, maxChars: number): string {
+  if (content.length <= maxChars) {
+    return content;
+  }
+
+  // Keep first portion and add truncation notice
+  const truncated = content.slice(0, maxChars);
+  const lastNewline = truncated.lastIndexOf("\n");
+  const cleanTruncated = lastNewline > maxChars * 0.8 ? truncated.slice(0, lastNewline) : truncated;
+
+  return `${cleanTruncated}\n\n... [truncated ${content.length - cleanTruncated.length} chars for token efficiency]`;
+}
+
+/**
+ * Build a compact runtime line for token efficiency.
+ */
+function buildCompactRuntimeLine(
+  runtimeInfo?: {
+    agentId?: string;
+    host?: string;
+    model?: string;
+    channel?: string;
+  },
+  runtimeChannel?: string,
+  runtimeCapabilities: string[] = [],
+  defaultThinkLevel?: ThinkLevel,
+): string {
+  const parts = [
+    runtimeInfo?.agentId ? `agent=${runtimeInfo.agentId}` : "",
+    runtimeInfo?.host ? `host=${runtimeInfo.host}` : "",
+    runtimeInfo?.model ? `model=${runtimeInfo.model}` : "",
+    runtimeChannel ? `channel=${runtimeChannel}` : "",
+    `thinking=${defaultThinkLevel ?? "off"}`,
+  ].filter(Boolean);
+
+  return parts.join(" | ");
 }
 
 export function buildRuntimeLine(
